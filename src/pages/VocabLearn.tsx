@@ -6,7 +6,7 @@ import { useLearningStore } from '../store/learningStore';
 import { useAuthStore } from '../store/authStore';
 import { achievements } from '../data/achievements';
 import AchievementToast from '../components/AchievementToast';
-import { speak, probeVoice, isSpeechSupported } from '../utils/speech';
+import { speak, diagnoseVoices } from '../utils/speech';
 import type { LanguageCode } from '../types';
 
 const VocabLearn = () => {
@@ -129,53 +129,37 @@ const VocabLearn = () => {
     }
   };
 
-  const handleSpeak = () => speak(current.word, current.language);
+  const handleSpeak = () => {
+    // 加个短暂的 loading 效果提示（云端 TTS 有网络延迟）
+    speak(current.word, current.language).catch((err) => {
+      console.warn('[VocabLearn] 朗读失败:', err?.message ?? err);
+    });
+  };
 
-  /** 诊断语音合成状态（供技术支持使用） */
+  /** 诊断语音合成状态 — 使用新的混合方案 */
   const runDiagnostic = useCallback(async () => {
     setTesting(true);
     setDiagResult(null);
 
-    const apiOk = isSpeechSupported();
-    let allVoices: string[] = [];
+    const diag = diagnoseVoices();
+
+    // 测试云端 TTS 音频播放
+    let cloudTtsOk = false;
     try {
-      const synth = (window as unknown as { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
-      if (synth) {
-        // 等待 voices 就绪
-        await new Promise<void>((r) => {
-          const v = synth.getVoices();
-          if (v.length > 0) { allVoices = Array.from(v).map((x) => `${x.name} [${x.lang}]`); r(); return; }
-          const fn = () => { allVoices = Array.from(synth.getVoices()).map((x) => `${x.name} [${x.lang}]`); r(); };
-          synth.addEventListener('voiceschanged', fn, { once: true });
-          setTimeout(r, 2000);
-        });
-      }
+      await speak('Hello', 'en');
+      cloudTtsOk = true;
     } catch { /* ignore */ }
 
-    const langs: LanguageCode[] = ['en', 'ja', 'ko'];
-    const probe = await Promise.all(
-      langs.map(async (lang) => {
-        const r = await probeVoice(lang);
-        return { lang, ok: r.supported, voice: r.bestVoice };
-      })
-    );
-
-    // 实际测试朗读
-    let testOk = false;
-    try {
-      await new Promise<void>((res) => {
-        const synth = (window as unknown as { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
-        if (!synth) { res(); return; }
-        const u = new SpeechSynthesisUtterance('Hello');
-        u.onend = () => res();
-        u.onerror = () => res();
-        setTimeout(res, 3000);
-        synth.speak(u);
-      });
-      testOk = true;
-    } catch { /* ignore */ }
-
-    setDiagResult({ apiOk, voices: allVoices, probe, testOk });
+    setDiagResult({
+      apiOk: diag.webApi,
+      voices: diag.systemVoices.map((v) => `${v.name} [${v.lang}]`),
+      probe: [
+        { lang: 'en', ok: diag.hasEnVoice, voice: diag.hasEnVoice ? '系统语音' : null },
+        { lang: 'ja', ok: diag.hasJaVoice, voice: diag.hasJaVoice ? '系统语音' : null },
+        { lang: 'ko', ok: diag.hasKoVoice, voice: diag.hasKoVoice ? '系统语音' : null },
+      ],
+      testOk: cloudTtsOk,
+    });
     setTesting(false);
   }, []);
 
@@ -197,64 +181,69 @@ const VocabLearn = () => {
         <div className="mb-6 p-4 rounded-2xl bg-ink-800 border border-ink-600 text-xs">
           <div className="font-semibold text-ink-200 mb-3 flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-gold-400" />
-            语音合成诊断报告
+            语音合成诊断报告（云端 TTS + 系统语音 双模式）
           </div>
 
           {testing ? (
-            <div className="text-ink-400 animate-pulse">🔄 正在诊断，请稍候...</div>
+            <div className="text-ink-400 animate-pulse">🔄 正在诊断，请稍候（将播放测试音频）...</div>
           ) : diagResult ? (
             <div className="space-y-3">
-              {/* API 支持状态 */}
-              <div className="flex items-center gap-2">
-                {diagResult.apiOk
-                  ? <CheckCircle className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-                  : <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
-                <span className="text-ink-200">
-                  Web Speech API：{diagResult.apiOk ? '✅ 支持' : '❌ 不支持'}
-                </span>
-              </div>
-
-              {/* 测试朗读结果 */}
+              {/* 朗读测试结果 */}
               <div className="flex items-center gap-2">
                 {diagResult.testOk
                   ? <CheckCircle className="w-4 h-4 text-emerald-400 flex-shrink-0" />
                   : <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
                 <span className="text-ink-200">
-                  朗读测试：{diagResult.testOk ? '✅ 可正常朗读' : '❌ 朗读失败'}
+                  🔊 朗读功能：{diagResult.testOk ? '✅ 可正常播放' : '❌ 播放失败（请检查网络）'}
                 </span>
               </div>
 
-              {/* 各语言语音检测 */}
+              {/* 系统语音检测 */}
               <div>
-                <div className="text-ink-400 mb-1.5">各语言语音检测：</div>
+                <div className="text-ink-400 mb-1.5">📱 本机系统语音包（Web Speech API）：</div>
+                {diagResult.voices.length === 0 ? (
+                  <div className="text-amber-400 ml-2 leading-relaxed">
+                    ⚠️ 未检测到系统语音包。这在华为/荣耀/小米等国产安卓上很常见。
+                    <br />
+                    <span className="text-ink-400">→ 系统将自动使用「云端 TTS 音频」播放，无需手动下载语音包。</span>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap gap-1.5 ml-2">
+                      {diagResult.voices.slice(0, 12).map((v, i) => (
+                        <span key={i} className="px-2 py-0.5 rounded-full bg-ink-700 text-ink-300 text-[10px]">{v}</span>
+                      ))}
+                      {diagResult.voices.length > 12 && (
+                        <span className="text-ink-500 text-[10px]">...共 {diagResult.voices.length} 个</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* 各语言支持状态 */}
+              <div>
+                <div className="text-ink-400 mb-1.5">🌐 各语言支持状态：</div>
                 {diagResult.probe.map((p) => (
                   <div key={p.lang} className="flex items-start gap-2 ml-2 mb-1">
                     {p.ok && p.voice
                       ? <CheckCircle className="w-3 h-3 text-emerald-400 flex-shrink-0 mt-0.5" />
-                      : <XCircle className="w-3 h-3 text-rose-400 flex-shrink-0 mt-0.5" />}
+                      : <CheckCircle className="w-3 h-3 text-sky-400 flex-shrink-0 mt-0.5" />}
                     <span className="text-ink-300">
-                      {p.lang.toUpperCase()}：{p.voice ? p.voice : '❌ 未找到语音'}
+                      {p.lang.toUpperCase()}：
+                      {p.ok && p.voice
+                        ? <span className="text-emerald-400">系统语音（本地，质量最佳）</span>
+                        : <span className="text-sky-400">云端 TTS 音频（网络播放，兼容所有设备）</span>}
                     </span>
                   </div>
                 ))}
               </div>
 
-              {/* 已安装的所有语音 */}
-              <div>
-                <div className="text-ink-400 mb-1.5">本机已安装语音（共 {diagResult.voices.length} 个）：</div>
-                {diagResult.voices.length === 0 ? (
-                  <div className="text-rose-400 ml-2">⚠️ 未检测到任何语音，可能是语音包未下载</div>
-                ) : (
-                  <div className="flex flex-wrap gap-1.5 ml-2">
-                    {diagResult.voices.map((v, i) => (
-                      <span key={i} className="px-2 py-0.5 rounded-full bg-ink-700 text-ink-300 text-[10px]">{v}</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="pt-1 text-ink-500 border-t border-ink-700 leading-relaxed">
-                💡 提示：若无语音，请连接 WiFi 后在手机「设置 → 语言与输入 → 语音」中下载对应语言的语音包。Android Chrome 使用系统级语音合成引擎。
+              {/* 云端 TTS 说明 */}
+              <div className="pt-2 border-t border-ink-700 text-ink-500 leading-relaxed">
+                🎯 <span className="text-ink-400">播放策略：</span>优先使用系统语音（质量最佳），没有系统语音时自动降级到百度翻译/Google 的云端 TTS 音频。
+                <br />
+                💡 <span className="text-ink-400">使用建议：</span>云端 TTS 需联网播放，建议在 WiFi 或流畅网络环境下使用。
               </div>
             </div>
           ) : (
