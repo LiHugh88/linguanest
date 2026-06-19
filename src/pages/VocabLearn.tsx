@@ -6,7 +6,7 @@ import { useLearningStore } from '../store/learningStore';
 import { useAuthStore } from '../store/authStore';
 import { achievements } from '../data/achievements';
 import AchievementToast from '../components/AchievementToast';
-import { speak, diagnoseVoices } from '../utils/speech';
+import { speak } from '../utils/speech';
 import type { LanguageCode } from '../types';
 
 const VocabLearn = () => {
@@ -136,29 +136,41 @@ const VocabLearn = () => {
     });
   };
 
-  /** 诊断语音合成状态 — 使用新的混合方案 */
+  /** 诊断语音合成状态 — 测试云端 TTS 音频播放 */
   const runDiagnostic = useCallback(async () => {
     setTesting(true);
     setDiagResult(null);
 
-    const diag = diagnoseVoices();
+    // 检查 Web Speech API 可用性
+    const apiOk = typeof window !== 'undefined' && !!window.speechSynthesis;
 
-    // 测试云端 TTS 音频播放
-    let cloudTtsOk = false;
+    // 检测系统语音
+    let systemVoices: string[] = [];
     try {
-      await speak('Hello', 'en');
-      cloudTtsOk = true;
+      if (apiOk) {
+        const voices = window.speechSynthesis!.getVoices();
+        systemVoices = voices.map((v) => `${v.name} [${v.lang}]`);
+      }
     } catch { /* ignore */ }
 
+    // 实际测试：依次播放英语、日语、韩语
+    const langs: LanguageCode[] = ['en', 'ja', 'ko'];
+    const results = await Promise.all(
+      langs.map(async (lang) => {
+        try {
+          await speak(
+            lang === 'en' ? 'Hello' : lang === 'ja' ? 'こんにちは' : '안녕하세요',
+            lang,
+          );
+          return { lang, ok: true, voice: '云端 TTS' };
+        } catch {
+            return { lang, ok: false, voice: null };
+        }
+      }),
+    );
+
     setDiagResult({
-      apiOk: diag.webApi,
-      voices: diag.systemVoices.map((v) => `${v.name} [${v.lang}]`),
-      probe: [
-        { lang: 'en', ok: diag.hasEnVoice, voice: diag.hasEnVoice ? '系统语音' : null },
-        { lang: 'ja', ok: diag.hasJaVoice, voice: diag.hasJaVoice ? '系统语音' : null },
-        { lang: 'ko', ok: diag.hasKoVoice, voice: diag.hasKoVoice ? '系统语音' : null },
-      ],
-      testOk: cloudTtsOk,
+      apiOk, voices: systemVoices, probe: results, testOk: results.some((r) => r.ok)
     });
     setTesting(false);
   }, []);

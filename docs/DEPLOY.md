@@ -308,6 +308,226 @@ location / {
 
 ---
 
+---
+
+## 附录 A：TTS 云端语音代理服务部署
+
+> 这是单词发音功能的核心基础设施。如果跳过此步骤，国产安卓手机（华为/荣耀/小米等）将无法播放英文/日语/韩语单词发音。
+
+### 为什么需要此服务
+
+- 国产安卓手机出厂时未预装英文/日语/韩语的系统 TTS 语音包
+- 浏览器原生 Web Speech API 在这些设备上无法朗读外语
+- 浏览器直接请求百度翻译 TTS API（`fanyi.baidu.com/gettts`）会返回 `403 Forbidden`
+- 需要通过服务器端 Python 代理模拟浏览器请求头
+
+完整技术方案参见：[`TTS-VOICE-SYNTHESIS.md`](./TTS-VOICE-SYNTHESIS.md)
+
+### 部署步骤
+
+**步骤 1：创建 Python 代理脚本**
+
+```bash
+sudo nano /usr/local/bin/tts-proxy.py
+```
+
+写入以下内容（完整脚本参见 `TTS-VOICE-SYNTHESIS.md`）：
+
+```python
+#!/usr/bin/env python3
+"""
+TTS Proxy Server — 代理请求百度翻译 TTS，解决浏览器直接请求 403 问题
+监听端口：8787（仅 127.0.0.1）
+API: GET /?lan=en&text=hello&spd=3
+"""
+import sys
+import urllib.request
+import urllib.parse
+import http.server
+import socketserver
+import ssl
+import socket
+
+PORT = 8787
+BAIDU_URL = "https://fanyi.baidu.com/gettts"
+
+# 模拟浏览器请求头 — 关键：User-Agent / Referer / Accept
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://fanyi.baidu.com/',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
+}
+
+class TTSHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        lan = params.get('lan', ['en'])[0]
+        text = params.get('text', [''])[0]
+        spd = params.get('spd', ['3'])[0]
+
+        if not text:
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Missing text')
+            return
+
+        url = f"{BAIDU_URL}?lan={lan}&text={urllib.parse.quote(text)}&spd={spd}&source=web"
+        req = urllib.request.Request(url, headers=HEADERS, method='GET')
+
+        # 强制使用 IPv4（避免 IPv6 网络不可达导致连接失败）
+        orig_getaddrinfo = socket.getaddrinfo
+        def ipv4_only(*args, **kwargs):
+            infos = orig_getaddrinfo(*args, **kwargs)
+            return [i for i in infos if i[0] == socket.AF_INET]
+        socket.getaddrinfo = ipv4_only
+
+        try:
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                audio_data = resp.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Length', str(len(audio_data)))
+                self.send_header('Cache-Control', 'public, max-age=3600')
+                self.end_headers()
+                self.wfile.write(audio_data)
+        except Exception as e:
+            print(f"[TTS Proxy] 请求失败: {e}", file=sys.stderr)
+            self.send_response(502)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'TTS Service Error')
+
+    def log_message(self, format, *args):
+        pass  # 静默日志，避免输出过多
+
+if __name__ == "__main__":
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(('127.0.0.1', PORT), TTSHandler) as httpd:
+        print(f"TTS Proxy listening on 127.0.0.1:{PORT}")
+        httpd.serve_forever()
+```
+
+**步骤 2：赋予执行权限**
+
+```bash
+sudo chmod +x /usr/local/bin/tts-proxy.py
+```
+
+**步骤 3：创建 systemd 服务配置**
+
+```bash
+sudo nano /etc/systemd/system/tts-proxy.service
+```
+
+```ini
+[Unit]
+Description=TTS Proxy Server (Baidu Translate TTS for multilingual learning)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/tts-proxy.py
+Restart=always
+RestartSec=3
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**步骤 4：启动并设置开机自启**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start tts-proxy
+sudo systemctl enable tts-proxy   # 开机自启
+```
+
+**步骤 5：验证 TTS 代理**
+
+```bash
+# 本地测试（直接请求 Python 代理）
+curl -s "http://127.0.0.1:8787/?lan=en&text=hello&spd=3" -o /tmp/test.mp3
+file /tmp/test.mp3
+# 预期输出：MPEG ADTS, layer III, v1, 160 kbps, 44.1 kHz, Monaural
+
+# 通过 Nginx 测试（模拟前端请求）
+curl -s "http://127.0.0.1:81/api/tts/?lan=en&text=hello&spd=3" -o /dev/null -w "%{http_code}"
+# 预期输出：200
+```
+
+**步骤 6：更新 Nginx 配置（添加 /api/tts/ 路由）**
+
+在 `linguanest` 的 Nginx 配置中，`server` 块内 `/` location 之前添加：
+
+```nginx
+# TTS 代理：转发到本地 Python 服务（端口 8787）
+location /api/tts/ {
+    add_header 'Access-Control-Allow-Origin' '*';
+    add_header 'Access-Control-Allow-Methods' 'GET, OPTIONS';
+    proxy_pass http://127.0.0.1:8787/;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 30s;
+    expires 1h;
+    add_header Cache-Control 'public';
+}
+```
+
+然后：
+
+```bash
+sudo nginx -t          # 检查语法
+sudo systemctl reload nginx   # 重载配置（不中断连接）
+```
+
+**TTS 代理服务管理命令**
+
+```bash
+# 查看状态
+sudo systemctl status tts-proxy
+
+# 重启
+sudo systemctl restart tts-proxy
+
+# 停止
+sudo systemctl stop tts-proxy
+
+# 查看日志（实时）
+sudo journalctl -u tts-proxy -f
+
+# 查看最近 20 行日志
+sudo journalctl -u tts-proxy -n 20
+```
+
+**服务器完整目录结构（含 TTS）**
+
+```
+/usr/local/bin/
+└── tts-proxy.py           ← Python TTS 代理脚本
+
+/etc/systemd/system/
+└── tts-proxy.service      ← systemd 服务配置
+
+/var/www/
+└── linguanest/            ← LinguaNest 构建产物
+    ├── index.html
+    └── assets/
+
+/etc/nginx/
+├── sites-available/
+│   └── linguanest         ← 站点配置（含 /api/tts/ 路由）
+└── sites-enabled/
+    └── linguanest → ../sites-available/linguanest
+```
+
+---
+
 ## 服务器维护命令
 
 ```bash
@@ -328,4 +548,13 @@ sudo tail -f /var/log/nginx/error.log
 
 # 查看访问日志
 sudo tail -f /var/log/nginx/access.log
+
+# 查看 TTS 代理状态
+sudo systemctl status tts-proxy
+
+# 查看 TTS 代理日志
+sudo journalctl -u tts-proxy -f
+
+# 一键测试 TTS 链路
+curl -s "http://127.0.0.1:81/api/tts/?lan=en&text=hello&spd=3" -o /dev/null -w "HTTP %{http_code}\n"
 ```
