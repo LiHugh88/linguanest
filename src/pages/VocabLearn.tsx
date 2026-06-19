@@ -1,12 +1,13 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect, useCallback } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ChevronLeft, Volume2, RotateCcw, Check } from 'lucide-react';
+import { ChevronLeft, Volume2, RotateCcw, Check, AlertCircle, CheckCircle, XCircle, Info } from 'lucide-react';
 import { vocabItems, courses } from '../data';
 import { useLearningStore } from '../store/learningStore';
 import { useAuthStore } from '../store/authStore';
 import { achievements } from '../data/achievements';
 import AchievementToast from '../components/AchievementToast';
-import { speak } from '../utils/speech';
+import { speak, probeVoice, isSpeechSupported } from '../utils/speech';
+import type { LanguageCode } from '../types';
 
 const VocabLearn = () => {
   const { courseId = '' } = useParams();
@@ -18,6 +19,14 @@ const VocabLearn = () => {
   const [flipped, setFlipped] = useState(false);
   const [knownIds, setKnownIds] = useState<Set<string>>(new Set());
   const [newAchievement, setNewAchievement] = useState<typeof achievements[number] | null>(null);
+  const [showDiag, setShowDiag] = useState(false);
+  const [diagResult, setDiagResult] = useState<{
+    apiOk: boolean;
+    voices: string[];
+    probe: { lang: string; ok: boolean; voice: string | null }[];
+    testOk: boolean;
+  } | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const addRecord = useLearningStore((s) => s.addRecord);
   const markVocabMastered = useLearningStore((s) => s.markVocabMastered);
@@ -122,8 +131,139 @@ const VocabLearn = () => {
 
   const handleSpeak = () => speak(current.word, current.language);
 
+  /** 诊断语音合成状态（供技术支持使用） */
+  const runDiagnostic = useCallback(async () => {
+    setTesting(true);
+    setDiagResult(null);
+
+    const apiOk = isSpeechSupported();
+    let allVoices: string[] = [];
+    try {
+      const synth = (window as unknown as { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
+      if (synth) {
+        // 等待 voices 就绪
+        await new Promise<void>((r) => {
+          const v = synth.getVoices();
+          if (v.length > 0) { allVoices = Array.from(v).map((x) => `${x.name} [${x.lang}]`); r(); return; }
+          const fn = () => { allVoices = Array.from(synth.getVoices()).map((x) => `${x.name} [${x.lang}]`); r(); };
+          synth.addEventListener('voiceschanged', fn, { once: true });
+          setTimeout(r, 2000);
+        });
+      }
+    } catch { /* ignore */ }
+
+    const langs: LanguageCode[] = ['en', 'ja', 'ko'];
+    const probe = await Promise.all(
+      langs.map(async (lang) => {
+        const r = await probeVoice(lang);
+        return { lang, ok: r.supported, voice: r.bestVoice };
+      })
+    );
+
+    // 实际测试朗读
+    let testOk = false;
+    try {
+      await new Promise<void>((res) => {
+        const synth = (window as unknown as { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
+        if (!synth) { res(); return; }
+        const u = new SpeechSynthesisUtterance('Hello');
+        u.onend = () => res();
+        u.onerror = () => res();
+        setTimeout(res, 3000);
+        synth.speak(u);
+      });
+      testOk = true;
+    } catch { /* ignore */ }
+
+    setDiagResult({ apiOk, voices: allVoices, probe, testOk });
+    setTesting(false);
+  }, []);
+
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
+      {/* 诊断面板切换按钮 */}
+      <div className="flex justify-end mb-4">
+        <button
+          onClick={() => { setShowDiag(!showDiag); if (!showDiag && !diagResult) runDiagnostic(); }}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-ink-800 border border-ink-600 text-ink-400 hover:text-ink-200 hover:border-ink-500 transition"
+        >
+          <Info className="w-3 h-3" />
+          语音诊断 {showDiag ? '▲' : '▼'}
+        </button>
+      </div>
+
+      {/* 诊断面板 */}
+      {showDiag && (
+        <div className="mb-6 p-4 rounded-2xl bg-ink-800 border border-ink-600 text-xs">
+          <div className="font-semibold text-ink-200 mb-3 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-gold-400" />
+            语音合成诊断报告
+          </div>
+
+          {testing ? (
+            <div className="text-ink-400 animate-pulse">🔄 正在诊断，请稍候...</div>
+          ) : diagResult ? (
+            <div className="space-y-3">
+              {/* API 支持状态 */}
+              <div className="flex items-center gap-2">
+                {diagResult.apiOk
+                  ? <CheckCircle className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                  : <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
+                <span className="text-ink-200">
+                  Web Speech API：{diagResult.apiOk ? '✅ 支持' : '❌ 不支持'}
+                </span>
+              </div>
+
+              {/* 测试朗读结果 */}
+              <div className="flex items-center gap-2">
+                {diagResult.testOk
+                  ? <CheckCircle className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                  : <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
+                <span className="text-ink-200">
+                  朗读测试：{diagResult.testOk ? '✅ 可正常朗读' : '❌ 朗读失败'}
+                </span>
+              </div>
+
+              {/* 各语言语音检测 */}
+              <div>
+                <div className="text-ink-400 mb-1.5">各语言语音检测：</div>
+                {diagResult.probe.map((p) => (
+                  <div key={p.lang} className="flex items-start gap-2 ml-2 mb-1">
+                    {p.ok && p.voice
+                      ? <CheckCircle className="w-3 h-3 text-emerald-400 flex-shrink-0 mt-0.5" />
+                      : <XCircle className="w-3 h-3 text-rose-400 flex-shrink-0 mt-0.5" />}
+                    <span className="text-ink-300">
+                      {p.lang.toUpperCase()}：{p.voice ? p.voice : '❌ 未找到语音'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {/* 已安装的所有语音 */}
+              <div>
+                <div className="text-ink-400 mb-1.5">本机已安装语音（共 {diagResult.voices.length} 个）：</div>
+                {diagResult.voices.length === 0 ? (
+                  <div className="text-rose-400 ml-2">⚠️ 未检测到任何语音，可能是语音包未下载</div>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 ml-2">
+                    {diagResult.voices.map((v, i) => (
+                      <span key={i} className="px-2 py-0.5 rounded-full bg-ink-700 text-ink-300 text-[10px]">{v}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="pt-1 text-ink-500 border-t border-ink-700 leading-relaxed">
+                💡 提示：若无语音，请连接 WiFi 后在手机「设置 → 语言与输入 → 语音」中下载对应语言的语音包。Android Chrome 使用系统级语音合成引擎。
+              </div>
+            </div>
+          ) : (
+            <div className="text-ink-400">点击上方按钮开始诊断</div>
+          )}
+        </div>
+      )}
+
+      {/* 导航栏 */}
       <div className="flex items-center justify-between mb-6">
         <Link to="/courses" className="flex items-center gap-1.5 text-sm text-ink-300 hover:text-white transition">
           <ChevronLeft className="w-4 h-4" /> 返回课程
